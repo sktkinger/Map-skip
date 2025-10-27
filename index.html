@@ -488,7 +488,9 @@
       }
     }
   </style>
-  <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyCitjjSqZR2eaxueq_2vq5To1KPjhQcABU&libraries=places"></script>
+  <script>
+    const MAPBOX_ACCESS_TOKEN = 'YOUR_MAPBOX_ACCESS_TOKEN';
+  </script>
 </head>
 <body>
   <div class="main-wrapper">
@@ -538,6 +540,7 @@ const REQUEST_TIMEOUT = 60000;
 const BATCH_SIZE = 25;
 const HISTORY_KEY = 'search_history';
 const MAX_HISTORY = 10;
+const cityCoordinateCache = new Map();
 
 // --- 历史记录管理 ---
 class SearchHistory {
@@ -630,9 +633,9 @@ document.getElementById('clearHistory').onclick = () => {
 };
 
 // --- 辅助函数 ---
-function checkGoogleMapsAPI() {
-  if (typeof google === 'undefined' || !google.maps) {
-    throw new Error('API服务配额已耗尽，请稍后再试');
+function checkMapboxAccessToken() {
+  if (!MAPBOX_ACCESS_TOKEN || MAPBOX_ACCESS_TOKEN === 'YOUR_MAPBOX_ACCESS_TOKEN') {
+    throw new Error('Mapbox Access Token 未配置，请联系管理员');
   }
 }
 
@@ -651,37 +654,66 @@ function chunkArray(arr, size) {
   return chunks;
 }
 
+function formatDistance(meters) {
+  const miles = meters / 1609.34;
+  return `${miles.toFixed(1)} 英里`;
+}
+
+function formatDuration(seconds) {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.round((seconds % 3600) / 60);
+  if (minutes === 60) {
+    return `${hours + 1} 小时 0 分`;
+  }
+  if (hours > 0) {
+    return `${hours} 小时 ${minutes} 分`;
+  }
+  return `${minutes} 分`;
+}
+
 // --- 核心功能函数 ---
 
 // 根据地址获取经纬度和州名
 async function geocodeAddress(address) {
-  checkGoogleMapsAPI();
-  const geocodePromise = new Promise((resolve, reject) => {
-    const geocoder = new google.maps.Geocoder();
-    geocoder.geocode({address}, (results, status) => {
-      if (status !== "OK" || !results?.length) {
-        return reject(new Error(`地址查询失败: ${status}`));
-      }
-      const result = results[0];
-      let state = "";
-      let rawState = "";
-      for (const c of result.address_components) {
-        if (c.types.includes("administrative_area_level_1")) {
-          rawState = c.long_name;
-          state = rawState.toLowerCase().replace(/\s+/g, '-');
-          break;
-        }
-      }
-      if (!state) return reject(new Error("未能识别州名，无法继续"));
-      resolve({
-        lat: result.geometry.location.lat(),
-        lng: result.geometry.location.lng(),
-        state: state,
-        stateRaw: rawState
-      });
-    });
-  });
-  return withTimeout(geocodePromise, REQUEST_TIMEOUT);
+  checkMapboxAccessToken();
+  const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(address)}.json?access_token=${MAPBOX_ACCESS_TOKEN}&autocomplete=false&limit=1`;
+  const response = await withTimeout(fetch(url), REQUEST_TIMEOUT);
+  if (!response.ok) {
+    throw new Error('地址查询失败，请稍后再试');
+  }
+  const data = await response.json();
+  if (data.message) {
+    throw new Error(`地址查询失败: ${data.message}`);
+  }
+  const feature = data.features?.[0];
+  if (!feature) {
+    throw new Error('未找到匹配的地址，请检查输入');
+  }
+  const [lng, lat] = feature.center;
+  let stateRaw = '';
+  let stateKey = '';
+  const regionContext = feature.context?.find(item => item.id?.startsWith('region'));
+  if (regionContext) {
+    stateRaw = regionContext.text;
+  } else if (feature.place_type?.includes('region')) {
+    stateRaw = feature.text;
+  }
+  if (!stateRaw && feature.context) {
+    const placeContext = feature.context.find(item => item.id?.startsWith('place'));
+    stateRaw = placeContext?.text || '';
+  }
+  if (stateRaw) {
+    stateKey = stateRaw.toLowerCase().replace(/\./g, '').replace(/\s+/g, '-');
+  }
+  if (!stateKey) {
+    throw new Error('未能识别州名，无法继续');
+  }
+  return {
+    lat,
+    lng,
+    state: stateKey,
+    stateRaw
+  };
 }
 
 // 从本地JSON文件加载城市数据
@@ -698,49 +730,88 @@ async function getCitiesInState(stateKey) {
   }
 }
 
-// 批量距离计算函数
-function getDistancesForCityBatch(origin, cityChunk, stateRaw) {
-  const distancePromise = new Promise((resolve) => {
-    try {
-      checkGoogleMapsAPI();
-      const service = new google.maps.DistanceMatrixService();
-      service.getDistanceMatrix({
-        origins: [origin],
-        destinations: cityChunk.map(city => `${city}, ${stateRaw}`),
-        travelMode: google.maps.TravelMode.DRIVING,
-        unitSystem: google.maps.UnitSystem.IMPERIAL,
-      }, (response, status) => {
-        if (status !== 'OK') {
-          const errorResult = cityChunk.map(city => ({ city, distance: "批量查询失败", duration: "N/A", distanceVal: Infinity }));
-          resolve(errorResult);
-          return;
-        }
-
-        const results = response.rows[0].elements.map((element, index) => {
-          const city = cityChunk[index];
-          if (element.status === "OK") {
-            return {
-              city: city,
-              distance: element.distance.text,
-              duration: element.duration.text,
-              distanceVal: element.distance.value,
-              error: null
-            };
-          } else {
-            return { city: city, distance: "查询失败", duration: "N/A", distanceVal: Infinity, error: 'individual_error' };
-          }
-        });
-        resolve(results);
-      });
-    } catch (e) {
-      const exceptionResult = cityChunk.map(city => ({ city, distance: "服务异常", duration: "N/A", distanceVal: Infinity, error: 'service_error' }));
-      resolve(exceptionResult);
+async function geocodeCityForBatch(city, stateRaw) {
+  const cacheKey = `${city}|${stateRaw}`;
+  if (cityCoordinateCache.has(cacheKey)) {
+    return { city, ...cityCoordinateCache.get(cacheKey) };
+  }
+  try {
+    const query = `${city}, ${stateRaw}`;
+    const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(query)}.json?access_token=${MAPBOX_ACCESS_TOKEN}&autocomplete=false&limit=1`;
+    const response = await withTimeout(fetch(url), REQUEST_TIMEOUT);
+    if (!response.ok) {
+      throw new Error('城市地理编码失败');
     }
-  });
+    const data = await response.json();
+    if (data.message) {
+      throw new Error('城市地理编码失败');
+    }
+    const feature = data.features?.[0];
+    if (!feature) {
+      throw new Error('未找到对应城市');
+    }
+    const [lng, lat] = feature.center;
+    cityCoordinateCache.set(cacheKey, { lat, lng });
+    return { city, lat, lng };
+  } catch (error) {
+    return { city, error: true };
+  }
+}
 
-  return withTimeout(distancePromise, REQUEST_TIMEOUT).catch(() => {
-     return cityChunk.map(city => ({ city, distance: "请求超时", duration: "N/A", distanceVal: Infinity, error: 'timeout' }));
-  });
+// 批量距离计算函数
+async function getDistancesForCityBatch(origin, cityChunk, stateRaw) {
+  try {
+    checkMapboxAccessToken();
+    const geocodedCities = await Promise.all(cityChunk.map(city => geocodeCityForBatch(city, stateRaw)));
+    const validCities = geocodedCities.filter(item => !item.error);
+
+    if (validCities.length === 0) {
+      return cityChunk.map(city => ({ city, distance: "查询失败", duration: "N/A", distanceVal: Infinity, error: 'geocode_error' }));
+    }
+
+    const coordinateSegments = [`${origin.lng},${origin.lat}`, ...validCities.map(item => `${item.lng},${item.lat}`)];
+    const destinationIndexes = validCities.map((_, index) => index + 1).join(';');
+    const matrixUrl = `https://api.mapbox.com/directions-matrix/v1/mapbox/driving/${coordinateSegments.join(';')}?access_token=${MAPBOX_ACCESS_TOKEN}&annotations=duration,distance&sources=0&destinations=${destinationIndexes}`;
+    const matrixResponse = await withTimeout(fetch(matrixUrl), REQUEST_TIMEOUT);
+
+    if (!matrixResponse.ok) {
+      throw new Error('批量查询失败');
+    }
+
+    const matrixData = await matrixResponse.json();
+    if (matrixData.code && matrixData.code !== 'Ok') {
+      throw new Error('批量查询失败');
+    }
+    const distanceRow = matrixData.distances?.[0] || [];
+    const durationRow = matrixData.durations?.[0] || [];
+
+    let validIndex = 0;
+    return geocodedCities.map(item => {
+      if (item.error) {
+        return { city: item.city, distance: "查询失败", duration: "N/A", distanceVal: Infinity, error: 'geocode_error' };
+      }
+
+      const distMeters = distanceRow[validIndex];
+      const durationSeconds = durationRow[validIndex];
+      validIndex++;
+
+      if (distMeters == null || durationSeconds == null || !isFinite(distMeters) || !isFinite(durationSeconds)) {
+        return { city: item.city, distance: "查询失败", duration: "N/A", distanceVal: Infinity, error: 'matrix_error' };
+      }
+
+      return {
+        city: item.city,
+        distance: formatDistance(distMeters),
+        duration: formatDuration(durationSeconds),
+        distanceVal: distMeters,
+        lat: item.lat,
+        lng: item.lng,
+        error: null
+      };
+    });
+  } catch (error) {
+    return cityChunk.map(city => ({ city, distance: "服务异常", duration: "N/A", distanceVal: Infinity, error: 'service_error' }));
+  }
 }
 
 // 并发池
@@ -799,9 +870,9 @@ btn.onclick = async function() {
     const cities = await getCitiesInState(state);
 
     const cityChunks = chunkArray(cities, BATCH_SIZE);
-    
-    const tasks = cityChunks.map(chunk => 
-      () => getDistancesForCityBatch(`${lat},${lng}`, chunk, stateRaw)
+
+    const tasks = cityChunks.map(chunk =>
+      () => getDistancesForCityBatch({ lat, lng }, chunk, stateRaw)
     );
 
     progressContainer.style.display = 'block';
@@ -833,7 +904,7 @@ btn.onclick = async function() {
           <td>${r.distance}</td>
           <td>${r.duration}</td>
           <td>
-            <a class="nav-link" href="https://maps.google.com/maps?saddr=${encodeURIComponent(input)}&daddr=${encodeURIComponent(r.city + ', ' + stateRaw)}" target="_blank">📍 导航</a>
+            ${r.lat && r.lng ? `<a class="nav-link" href="https://www.mapbox.com/directions/?coordinates=${lng},${lat};${r.lng},${r.lat}&profile=driving" target="_blank">📍 导航</a>` : '<span class="nav-link" style="opacity:0.6;cursor:not-allowed;">📍 无法导航</span>'}
           </td>
         </tr>
       `).join('')}
